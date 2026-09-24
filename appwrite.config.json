@@ -1,0 +1,50 @@
+{
+    "projectId": "stackbot",
+    "projectName": "Stackbot",
+    "endpoint": "https://fra.cloud.appwrite.io/v1",
+    "functions": [
+        {
+            "$id": "discord-interactions",
+            "name": "discord-interactions",
+            "runtime": "node-22",
+            "execute": [
+                "any"
+            ],
+            "enabled": true,
+            "logging": true,
+            "timeout": 15,
+            "entrypoint": "src/main.js",
+            "commands": "npm install",
+            "path": "functions/discord-interactions",
+            "scopes": [
+                "execution.write"
+            ],
+            "specification": "s-0.5vcpu-512mb",
+            "ignore": [
+                "node_modules",
+                ".npm"
+            ]
+        },
+        {
+            "$id": "stackbot-agent",
+            "name": "stackbot-agent",
+            "runtime": "node-22",
+            "execute": [],
+            "enabled": true,
+            "logging": true,
+            "timeout": 900,
+            "entrypoint": "src/main.js",
+            "commands": "npm install",
+            "path": "functions/stackbot-agent",
+            "scopes": [
+                "rows.read",
+                "rows.write"
+            ],
+            "specification": "s-0.5vcpu-512mb",
+            "ignore": [
+                "node_modules",
+                ".npm"
+            ]
+        }
+    ]
+}

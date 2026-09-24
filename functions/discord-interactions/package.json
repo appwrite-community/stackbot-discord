@@ -1,0 +1,11 @@
+{
+  "name": "discord-interactions-function",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.js",
+  "dependencies": {
+    "discord-interactions": "^4.4.0",
+    "node-appwrite": "^29.0.0"
+  }
+}
