@@ -3,6 +3,9 @@ import { oauthErrorCode, refreshTokens } from './sign-in-with-appwrite.js';
 
 const TABLE_ID = 'connections';
 const REFRESH_MARGIN_MS = 60 * 1000;
+// One refresh request takes well under a second, so a claim older than
+// this belongs to an execution that stopped.
+const REFRESH_LEASE_MS = 30 * 1000;
 
 export class NotConnectedError extends Error {}
 
@@ -11,12 +14,30 @@ export class NotConnectedError extends Error {}
  * Discord user ID. Both token columns are encrypted at rest.
  */
 export function connectionsTable(req) {
-  const client = new Client()
-    .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
-    .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-    .setKey(req.headers['x-appwrite-key']);
-  const tablesDB = new TablesDB(client);
+  const createTablesDB = (headers = {}) => {
+    const client = new Client()
+      .setEndpoint(process.env.APPWRITE_FUNCTION_API_ENDPOINT)
+      .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
+      .setKey(req.headers['x-appwrite-key']);
+    for (const [name, value] of Object.entries(headers)) client.addHeader(name, value);
+    return new TablesDB(client);
+  };
+  const tablesDB = createTablesDB();
   const table = { databaseId: process.env.DATABASE_ID, tableId: TABLE_ID };
+
+  /**
+   * Runs a write that only applies if the row did not change after it was
+   * read. Otherwise Appwrite rejects the write with a 409 error, and the
+   * function returns false.
+   */
+  const ifUnchanged = async (row, write) => {
+    try {
+      return await write(createTablesDB({ 'X-Appwrite-Timestamp': row.$updatedAt }));
+    } catch (err) {
+      if (err.code === 409 || err.code === 404) return false;
+      throw err;
+    }
+  };
 
   return {
     async get(discordUserId) {
@@ -32,12 +53,7 @@ export function connectionsTable(req) {
       return tablesDB.upsertRow({
         ...table,
         rowId: discordUserId,
-        data: {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token,
-          expiresAt: new Date(Date.now() + tokens.expires_in * 1000).toISOString(),
-          refreshLock: 1,
-        },
+        data: { ...tokenColumns(tokens), refreshStartedAt: null },
       });
     },
 
@@ -45,43 +61,36 @@ export function connectionsTable(req) {
       await tablesDB.deleteRow({ ...table, rowId: discordUserId });
     },
 
-    /**
-     * Takes the refresh lock of one user. Appwrite applies the decrement
-     * atomically, so only one execution can take the lock from 1 to 0. For
-     * every other execution the value would go below the minimum, and
-     * Appwrite rejects the update with a 400 error.
-     */
-    async lockRefresh(discordUserId) {
-      try {
-        await tablesDB.decrementRowColumn({
-          ...table,
-          rowId: discordUserId,
-          column: 'refreshLock',
-          value: 1,
-          min: 0,
-        });
-        return true;
-      } catch (err) {
-        if (err.code === 404) throw new NotConnectedError();
-        if (err.code === 400) return false;
-        throw err;
-      }
+    /** Marks the row as refreshing. Returns the updated row, or false. */
+    claimRefresh(row) {
+      return ifUnchanged(row, (db) =>
+        db.updateRow({ ...table, rowId: row.$id, data: { refreshStartedAt: new Date().toISOString() } }),
+      );
     },
 
-    async unlockRefresh(discordUserId) {
-      try {
-        await tablesDB.incrementRowColumn({
-          ...table,
-          rowId: discordUserId,
-          column: 'refreshLock',
-          value: 1,
-          max: 1,
-        });
-      } catch (err) {
-        // The row is gone or the lock is already free.
-        if (err.code !== 404 && err.code !== 400) throw err;
-      }
+    releaseRefresh(row) {
+      return ifUnchanged(row, (db) =>
+        db.updateRow({ ...table, rowId: row.$id, data: { refreshStartedAt: null } }),
+      );
     },
+
+    saveRefreshed(row, tokens) {
+      return ifUnchanged(row, (db) =>
+        db.updateRow({ ...table, rowId: row.$id, data: { ...tokenColumns(tokens), refreshStartedAt: null } }),
+      );
+    },
+
+    async removeIfUnchanged(row) {
+      return (await ifUnchanged(row, (db) => db.deleteRow({ ...table, rowId: row.$id }))) !== false;
+    },
+  };
+}
+
+function tokenColumns(tokens) {
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    expiresAt: new Date(Date.now() + tokens.expires_in * 1000).toISOString(),
   };
 }
 
@@ -91,57 +100,51 @@ export function connectionsTable(req) {
  *
  * Each refresh token works once. If Appwrite sees the same refresh token
  * twice, it treats the second use as theft and revokes the whole grant. So
- * only the execution that holds the refresh lock refreshes. Every other
- * execution waits for the new tokens to appear in the row.
+ * an execution first claims the refresh by setting refreshStartedAt with a
+ * conditional write, which only one execution can win. The others wait for
+ * the new tokens. If the claim is older than the lease, the execution that
+ * made it stopped, and the next execution claims the refresh again.
  */
 export async function getAccessToken(connections, discordUserId) {
-  const connection = await connections.get(discordUserId);
-  if (!connection) throw new NotConnectedError();
-  if (isFresh(connection)) return connection.accessToken;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const connection = await connections.get(discordUserId);
+    if (!connection) throw new NotConnectedError();
+    if (isFresh(connection)) return connection.accessToken;
 
-  if (!(await connections.lockRefresh(discordUserId))) {
-    return waitForRefresh(connections, discordUserId);
+    if (isRefreshing(connection)) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      continue;
+    }
+
+    const claimed = await connections.claimRefresh(connection);
+    if (!claimed) continue;
+
+    let tokens;
+    try {
+      tokens = await refreshTokens(connection.refreshToken);
+    } catch (err) {
+      if (oauthErrorCode(err) !== 'invalid_grant') {
+        await connections.releaseRefresh(claimed);
+        throw err;
+      }
+      // Only this execution used the refresh token, so the user revoked
+      // access. If the user connected again in the meantime, the row
+      // changed, the delete does not apply, and the loop reads the new row.
+      if (await connections.removeIfUnchanged(claimed)) throw new NotConnectedError();
+      continue;
+    }
+
+    if (await connections.saveRefreshed(claimed, tokens)) return tokens.access_token;
+    // The user connected again during the refresh. The new tokens belong
+    // to the old grant, so the loop reads the new row instead.
   }
 
-  let locked = true;
-  try {
-    // Another execution can refresh between the first read and the lock.
-    const latest = await connections.get(discordUserId);
-    if (!latest) throw new NotConnectedError();
-    if (isFresh(latest)) return latest.accessToken;
-
-    const tokens = await refreshTokens(latest.refreshToken);
-    // Saving the new tokens also sets refreshLock back to 1.
-    await connections.save(discordUserId, tokens);
-    locked = false;
-    return tokens.access_token;
-  } catch (err) {
-    if (oauthErrorCode(err) !== 'invalid_grant') throw err;
-    // Only this execution used the refresh token, so Appwrite rejected it
-    // because the user revoked access.
-    await connections.remove(discordUserId);
-    locked = false;
-    throw new NotConnectedError();
-  } finally {
-    if (locked) await connections.unlockRefresh(discordUserId);
-  }
+  throw new Error('Timed out while waiting for a token refresh');
 }
 
-/**
- * Runs when another execution holds the refresh lock. The new tokens show
- * up in the row within a few seconds. If they do not, the other execution
- * stopped before it saved them, and the user connects again with
- * /stackbot connect, which also frees the lock.
- */
-async function waitForRefresh(connections, discordUserId) {
-  for (let attempt = 0; attempt < 10; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const latest = await connections.get(discordUserId);
-    if (!latest) throw new NotConnectedError();
-    if (isFresh(latest)) return latest.accessToken;
-  }
-
-  throw new NotConnectedError();
+function isRefreshing(connection) {
+  if (!connection.refreshStartedAt) return false;
+  return Date.now() - new Date(connection.refreshStartedAt).getTime() < REFRESH_LEASE_MS;
 }
 
 /**
