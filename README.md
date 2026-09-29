@@ -44,6 +44,7 @@ Replies are ephemeral, so only the person who asked can see project data.
    turn on **Device flow** on the **OAuth client** page, and create a secret on **OAuth secrets**.
 3. Create a TablesDB database with a `connections` table. Add three required columns:
    `accessToken` (text, encrypted), `refreshToken` (text, encrypted), and `expiresAt` (datetime).
+   Add a fourth, optional column `refreshLock` (integer, min 0, max 1, default 1).
 4. Set `projectId` and `endpoint` in `appwrite.config.json`, then run `appwrite push functions`.
 5. Set these variables and redeploy both functions:
 
