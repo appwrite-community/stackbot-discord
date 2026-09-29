@@ -1,11 +1,13 @@
-import { Client, TablesDB } from 'node-appwrite';
+import { AppwriteException, Client, TablesDB } from 'node-appwrite';
 import { oauthErrorCode, refreshTokens } from './sign-in-with-appwrite.js';
 
 const TABLE_ID = 'connections';
 const REFRESH_MARGIN_MS = 60 * 1000;
-// One refresh request takes well under a second, so a claim older than
-// this belongs to an execution that stopped.
+// A claim on a refresh lasts 30 seconds, and the refresh request is aborted
+// after 10. A claim older than 30 seconds belongs to an execution that
+// stopped, and its refresh token is no longer in use.
 const REFRESH_LEASE_MS = 30 * 1000;
+const REFRESH_TIMEOUT_MS = 10 * 1000;
 
 export class NotConnectedError extends Error {}
 
@@ -121,10 +123,15 @@ export async function getAccessToken(connections, discordUserId) {
 
     let tokens;
     try {
-      tokens = await refreshTokens(connection.refreshToken);
+      tokens = await refreshTokens(connection.refreshToken, { timeoutMs: REFRESH_TIMEOUT_MS });
     } catch (err) {
       if (oauthErrorCode(err) !== 'invalid_grant') {
-        await connections.releaseRefresh(claimed);
+        // A 4xx answer means Appwrite did not use the refresh token, so the
+        // claim can go. After a timeout or a network error, the claim stays
+        // until the lease runs out.
+        if (err instanceof AppwriteException && err.code < 500) {
+          await connections.releaseRefresh(claimed);
+        }
         throw err;
       }
       // Only this execution used the refresh token, so the user revoked

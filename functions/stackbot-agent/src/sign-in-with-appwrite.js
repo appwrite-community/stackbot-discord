@@ -1,4 +1,4 @@
-import { Client, Oauth2 } from 'node-appwrite';
+import { AppwriteException, Client, Oauth2 } from 'node-appwrite';
 
 const DEVICE_CODE_GRANT = 'urn:ietf:params:oauth:grant-type:device_code';
 
@@ -78,13 +78,29 @@ export async function waitForApproval(deviceAuthorization) {
 /**
  * Trades a refresh token for a new pair. Appwrite rotates refresh tokens,
  * so the old one stops working as soon as this call succeeds.
+ *
+ * This request uses fetch instead of the SDK, because fetch can abort it.
+ * After the abort, Appwrite either already has the whole request and
+ * answers it within milliseconds, or it never receives it. So the refresh
+ * is over well before the claim on the row expires.
  */
-export async function refreshTokens(refreshToken) {
-  return oauth2().createToken({
-    grantType: 'refresh_token',
-    refreshToken,
-    ...clientCredentials(),
+export async function refreshTokens(refreshToken, { timeoutMs }) {
+  const response = await fetch(`${process.env.APPWRITE_CONSOLE_ENDPOINT}/oauth2/console/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-appwrite-project': 'console' },
+    body: JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: process.env.APPWRITE_CLIENT_ID,
+      client_secret: process.env.APPWRITE_CLIENT_SECRET,
+    }),
+    signal: AbortSignal.timeout(timeoutMs),
   });
+  const body = await response.text();
+  if (!response.ok) {
+    throw new AppwriteException('Token refresh failed', response.status, '', body);
+  }
+  return JSON.parse(body);
 }
 
 /**
