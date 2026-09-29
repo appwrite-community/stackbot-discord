@@ -4,8 +4,8 @@ import { oauthErrorCode, refreshTokens } from './sign-in-with-appwrite.js';
 const TABLE_ID = 'connections';
 const REFRESH_MARGIN_MS = 60 * 1000;
 // A claim on a refresh lasts 30 seconds, and the refresh request is aborted
-// after 10. A claim older than 30 seconds belongs to an execution that
-// stopped, and its refresh token is no longer in use.
+// after 10. An aborted refresh never saves tokens, so when a claim is older
+// than 30 seconds, its refresh is over and another execution can claim it.
 const REFRESH_LEASE_MS = 30 * 1000;
 const REFRESH_TIMEOUT_MS = 10 * 1000;
 

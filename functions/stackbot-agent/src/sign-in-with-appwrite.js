@@ -80,9 +80,10 @@ export async function waitForApproval(deviceAuthorization) {
  * so the old one stops working as soon as this call succeeds.
  *
  * This request uses fetch instead of the SDK, because fetch can abort it.
- * After the abort, Appwrite either already has the whole request and
- * answers it within milliseconds, or it never receives it. So the refresh
- * is over well before the claim on the row expires.
+ * An aborted refresh never saves tokens. If Appwrite did not process it,
+ * the old refresh token still works. If Appwrite did, the new tokens are
+ * lost with the response and the grant cannot be used again. Either way the
+ * refresh is over when the claim on the row expires.
  */
 export async function refreshTokens(refreshToken, { timeoutMs }) {
   const response = await fetch(`${process.env.APPWRITE_CONSOLE_ENDPOINT}/oauth2/console/token`, {
